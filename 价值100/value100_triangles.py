@@ -16,6 +16,7 @@
 import csv
 import json
 import math
+import time
 import urllib.parse
 import urllib.request
 from datetime import date, timedelta
@@ -30,7 +31,7 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import FixedLocator, FuncFormatter, LogLocator, NullFormatter
 
 BASE = Path(__file__).resolve().parent
-CSV_PATH = BASE / "cni_980081_daily.csv"
+CSV_PATH = BASE / f"cni_980081_daily_{time.strftime('%Y-%m-%d')}.csv"
 PNG = BASE / "价值100_三角形周期.png"
 PDF = BASE / "价值100_三角形周期.pdf"
 

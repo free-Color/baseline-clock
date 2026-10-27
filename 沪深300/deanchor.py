@@ -41,7 +41,7 @@ from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
 CSV_HIST = BASE / "hist_csi.csv"
-CSV_YEAR = BASE / "csi_2026_daily.csv"
+CSV_YEAR = BASE / f"csi_2026_daily_{time.strftime('%Y-%m-%d')}.csv"
 CSV_ANCHOR = BASE / "an_anchor_today.csv"
 PNG = BASE / "deanchor_today.png"
 
