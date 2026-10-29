@@ -31,7 +31,7 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import FixedLocator, FuncFormatter, LogLocator, NullFormatter
 
 BASE = Path(__file__).resolve().parent
-CSV_PATH = BASE / f"cni_980081_daily_{time.strftime('%Y-%m-%d')}.csv"
+CSV_PATH = BASE / "cni_980081_daily.csv"
 PNG = BASE / "价值100_三角形周期.png"
 PDF = BASE / "价值100_三角形周期.pdf"
 
@@ -66,6 +66,7 @@ CYCLE_POS = [(dt(2014, 8, 1), 2150), (dt(2017, 6, 1), 2600),
 
 
 def fetch_cni(start="2000-01-01", end=None):
+    """抓国证日线；单次大区间只回到较早日期，所以再补抓最近 60 天。失败自动重试 3 次。"""
     end = end or date.today().isoformat()
     url = "http://hq.cnindex.com.cn/market/market/getIndexDailyDataWithDataFormat"
 
@@ -83,16 +84,7 @@ def fetch_cni(start="2000-01-01", end=None):
     return [{"date": k, "close": uniq[k]} for k in sorted(uniq)]
 
 
-def load():
-    if not CSV_PATH.exists():
-        print(f"{CSV_PATH.name} 不存在，联网抓取中 ...")
-        rows = fetch_cni()
-        with CSV_PATH.open("w", newline="", encoding="utf-8-sig") as f:
-            w = csv.DictWriter(f, fieldnames=["date", "close"])
-            w.writeheader()
-            w.writerows(rows)
-        print(f"已保存 {CSV_PATH.name}（{len(rows)} 行）")
-
+def read_csv():
     out = []
     with CSV_PATH.open(encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
@@ -102,6 +94,43 @@ def load():
                 continue
     out.sort()
     return out
+
+
+def write_csv(rows):
+    with CSV_PATH.open("w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=["date", "close"])
+        w.writeheader()
+        w.writerows(rows)
+
+
+def load():
+    """优先读本目录的 CSV；缺失或行数太少就联网抓取并存回本目录（不依赖当前工作目录）。"""
+    if CSV_PATH.exists():
+        rows = read_csv()
+        if len(rows) >= 800:
+            return rows
+        print(f"{CSV_PATH.name} 只有 {len(rows)} 行，数据不完整，重新联网抓取 ...")
+    else:
+        print(f"{CSV_PATH.name} 不存在，联网抓取 ...")
+
+    last_err = ""
+    for i in range(3):
+        try:
+            rows = fetch_cni()
+            if len(rows) >= 800:
+                write_csv(rows)
+                print(f"已保存 {CSV_PATH}（{len(rows)} 行）")
+                return read_csv()
+            last_err = f"只取到 {len(rows)} 行"
+        except Exception as e:  # noqa: BLE001
+            last_err = f"{type(e).__name__}: {e}"
+        print(f"  第 {i + 1} 次抓取失败：{last_err}")
+        time.sleep(2)
+
+    raise SystemExit(
+        f"\n数据抓取失败（{last_err}）。\n"
+        f"请检查网络后重跑，或把 {CSV_PATH.name} 手动放到：{BASE}\n"
+    )
 
 
 def years(a, b):
@@ -119,11 +148,16 @@ def fit_line(xs, ys):
 
 def main():
     data = load()
-    if len(data) < 200:
-        raise SystemExit("数据太少，检查 cni_980081_daily.csv")
     close = dict(data)
     t0 = data[0][0]
     last_date, last_close = data[-1]
+
+    # 校验关键日期是否都在数据里（数据被截断时给出明确提示，而不是 KeyError）
+    need = [dt.strptime(d, "%Y-%m-%d") for d, _ in TURNS] + \
+           [dt.strptime(d, "%Y-%m-%d") for d in FIT_LOWS]
+    missing = [d.date().isoformat() for d in need if d not in close]
+    if missing:
+        raise SystemExit(f"数据缺少这些日期：{missing}\n请删除 {CSV_PATH} 后重跑，让它重新联网抓取。")
 
     turns = []
     for ds, kind in TURNS:
@@ -141,6 +175,7 @@ def main():
 
     line_today = line_at(last_date)
     gap = (last_close / line_today - 1) * 100
+    drop_to_line = (line_today / last_close - 1) * 100
 
     x_left = data[0][0] - timedelta(days=45)
     x_right = dt(2028, 12, 31)
@@ -220,7 +255,8 @@ def main():
     # 当前点位
     ax.scatter([last_date], [last_close], s=42, facecolor="white", edgecolor="#6f6f6f",
                zorder=8, linewidth=1.4)
-    ax.annotate(f"当前 {last_close:,.0f}（{last_date.date()}）\n较基线 +{gap:.0f}%",
+    ax.annotate(f"当前 {last_close:,.0f}（{last_date.date()}）\n"
+                f"较基线 +{gap:.1f}%｜跌到基线还需 {drop_to_line:.1f}%",
                 xy=(last_date, last_close), xytext=(dt(2027, 2, 1), 5050),
                 textcoords="data", fontsize=8.0, color="#3a3a3a", ha="left", va="center", zorder=9,
                 linespacing=1.4,
