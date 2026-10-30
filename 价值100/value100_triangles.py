@@ -65,72 +65,96 @@ CYCLE_POS = [(dt(2014, 8, 1), 2150), (dt(2017, 6, 1), 2600),
              (dt(2020, 7, 1), 3100), (dt(2025, 4, 1), 4300)]
 
 
-def fetch_cni(start="2000-01-01", end=None):
-    """抓国证日线；单次大区间只回到较早日期，所以再补抓最近 60 天。失败自动重试 3 次。"""
-    end = end or date.today().isoformat()
-    url = "http://hq.cnindex.com.cn/market/market/getIndexDailyDataWithDataFormat"
+API = "http://hq.cnindex.com.cn/market/market/getIndexDailyDataWithDataFormat"
 
-    def once(s, e):
-        q = urllib.parse.urlencode({"indexCode": "980081", "startDate": s,
-                                    "endDate": e, "frequency": "day"})
-        req = urllib.request.Request(f"{url}?{q}", headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=40) as r:
-            data = json.loads(r.read().decode("utf-8"))
-        return [{"date": x[0], "close": float(x[1])}
-                for x in (data.get("data") or {}).get("data") or []]
 
-    rows = once(start, end) + once((date.today() - timedelta(days=60)).isoformat(), end)
-    uniq = {r["date"]: r["close"] for r in rows}
-    return [{"date": k, "close": uniq[k]} for k in sorted(uniq)]
+def fetch_range(start, end):
+    """抓 [start, end] 的日线，返回 [(datetime, close)]；网络异常直接抛出。"""
+    q = urllib.parse.urlencode({"indexCode": "980081", "startDate": start,
+                                "endDate": end, "frequency": "day"})
+    req = urllib.request.Request(f"{API}?{q}", headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=40) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    rows = [(dt.strptime(x[0][:10], "%Y-%m-%d"), float(x[1]))
+            for x in (data.get("data") or {}).get("data") or []]
+    return sorted(rows)
+
+
+def fetch_full():
+    """全量：大区间 + 最近 60 天（接口对长区间只回到较早日期，尾部要单独补）。"""
+    today = date.today().isoformat()
+    rows = fetch_range("2000-01-01", today)
+    rows += fetch_range((date.today() - timedelta(days=60)).isoformat(), today)
+    return sorted(dict(rows).items())
 
 
 def read_csv():
-    out = []
+    uniq = {}
     with CSV_PATH.open(encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
             try:
-                out.append((dt.strptime(r["date"][:10], "%Y-%m-%d"), float(r["close"])))
+                uniq[dt.strptime(r["date"][:10], "%Y-%m-%d")] = float(r["close"])
             except (ValueError, KeyError):
                 continue
-    out.sort()
-    return out
+    return sorted(uniq.items())
 
 
 def write_csv(rows):
     with CSV_PATH.open("w", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=["date", "close"])
-        w.writeheader()
-        w.writerows(rows)
+        w = csv.writer(f)
+        w.writerow(["date", "close"])
+        for d, c in rows:
+            w.writerow([d.strftime("%Y-%m-%d"), c])
 
 
 def load():
-    """优先读本目录的 CSV；缺失或行数太少就联网抓取并存回本目录（不依赖当前工作目录）。"""
-    if CSV_PATH.exists():
-        rows = read_csv()
-        if len(rows) >= 800:
-            return rows
-        print(f"{CSV_PATH.name} 只有 {len(rows)} 行，数据不完整，重新联网抓取 ...")
-    else:
-        print(f"{CSV_PATH.name} 不存在，联网抓取 ...")
+    """读本目录 CSV，并在每次运行时自动检查/补齐最新数据：
 
-    last_err = ""
-    for i in range(3):
-        try:
-            rows = fetch_cni()
-            if len(rows) >= 800:
-                write_csv(rows)
-                print(f"已保存 {CSV_PATH}（{len(rows)} 行）")
-                return read_csv()
-            last_err = f"只取到 {len(rows)} 行"
-        except Exception as e:  # noqa: BLE001
-            last_err = f"{type(e).__name__}: {e}"
-        print(f"  第 {i + 1} 次抓取失败：{last_err}")
-        time.sleep(2)
+    - 文件缺失或行数太少  → 全量抓取（重试 3 次）
+    - 已有数据            → 只抓最近 30 天，与本地最后日期比对，缺几天补几天
+    - 联网失败            → 只报警告，继续用本地数据（不会让脚本跑不起来）
+    """
+    local = read_csv() if CSV_PATH.exists() else []
 
-    raise SystemExit(
-        f"\n数据抓取失败（{last_err}）。\n"
-        f"请检查网络后重跑，或把 {CSV_PATH.name} 手动放到：{BASE}\n"
-    )
+    if len(local) < 800:
+        reason = "不存在" if not local else f"只有 {len(local)} 行"
+        print(f"{CSV_PATH.name} {reason}，全量抓取 ...")
+        last_err = ""
+        for i in range(3):
+            try:
+                rows = fetch_full()
+                if len(rows) >= 800:
+                    write_csv(rows)
+                    print(f"已保存 {CSV_PATH}（{len(rows)} 行，截至 {rows[-1][0].date()}）")
+                    return rows
+                last_err = f"只取到 {len(rows)} 行"
+            except Exception as e:  # noqa: BLE001
+                last_err = f"{type(e).__name__}: {e}"
+            print(f"  第 {i + 1} 次抓取失败：{last_err}")
+            time.sleep(2)
+        raise SystemExit(
+            f"\n数据抓取失败（{last_err}）。\n"
+            f"请检查网络后重跑，或把 {CSV_PATH.name} 手动放到：{BASE}\n"
+        )
+
+    # —— 增量检查：合并后整条重写，天然去重、补缺口 ——
+    last_date_local = local[-1][0]
+    try:
+        recent = fetch_range((last_date_local - timedelta(days=10)).strftime("%Y-%m-%d"),
+                             date.today().isoformat())
+        merged = dict(local)
+        merged.update(dict(recent))
+        rows = sorted(merged.items())
+        write_csv(rows)
+        added = len([d for d in rows if d[0] > last_date_local])
+        if added:
+            print(f"数据更新：补 {added} 个交易日 → 共 {len(rows)} 行（截至 {rows[-1][0].date()}）")
+        else:
+            print(f"数据已是最新（{last_date_local.date()}，共 {len(rows)} 行）")
+        return rows
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠ 联网检查失败（{type(e).__name__}: {e}），改用本地数据，截至 {last_date_local.date()}")
+        return local
 
 
 def years(a, b):

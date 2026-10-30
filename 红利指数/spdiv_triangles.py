@@ -67,75 +67,116 @@ CYCLE_POS = [(dt(2019, 9, 1), 1600), (dt(2023, 6, 1), 1600), (dt(2025, 3, 1), 19
 BOT_POS = [(20, -18), (-20, -26), (-20, -28), (20, -26)]
 
 
-def fetch_nav(symbol="501029"):
-    """抓单位净值+累计净值，再按“分红在除息日再投资”链式复权，得到严格的全收益序列。"""
-    H = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn"}
-    url = "https://stock.finance.sina.com.cn/fundInfo/api/openapi.php/CaihuiFundInfoService.getNav"
+NAV_URL = "https://stock.finance.sina.com.cn/fundInfo/api/openapi.php/CaihuiFundInfoService.getNav"
+HEADERS = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn"}
+
+
+def fetch_nav_range(start, end, symbol="501029"):
+    """抓 [start, end] 的单位净值 + 累计净值，返回 [(date, nav, cum)]，按日期升序。"""
     raw, page = [], 1
     while True:
-        q = urllib.parse.urlencode({"symbol": symbol, "datefrom": "2000-01-01",
-                                    "dateto": date.today().isoformat(),
+        q = urllib.parse.urlencode({"symbol": symbol, "datefrom": start, "dateto": end,
                                     "page": page, "num": 100})
-        req = urllib.request.Request(f"{url}?{q}", headers=H)
+        req = urllib.request.Request(f"{NAV_URL}?{q}", headers=HEADERS)
         with urllib.request.urlopen(req, timeout=40) as r:
             payload = json.loads(r.read().decode("utf-8"))["result"]["data"]
         batch = payload["data"]
         if not batch:
             break
-        raw += [{"date": x["fbrq"][:10], "nav": float(x["jjjz"]), "cum": float(x["ljjz"])}
+        raw += [(dt.strptime(x["fbrq"][:10], "%Y-%m-%d"), float(x["jjjz"]), float(x["ljjz"]))
                 for x in batch]
         if len(raw) >= int(payload["total_num"]):
             break
         page += 1
         time.sleep(0.2)
-    raw.sort(key=lambda x: x["date"])
+    uniq = {}
+    for d, n, c in raw:
+        uniq[d] = (n, c)
+    return [(d, n, c) for d, (n, c) in sorted(uniq.items())]
 
-    tr = raw[0]["nav"]
-    rows = [{"date": raw[0]["date"], "nav": raw[0]["nav"], "cum": raw[0]["cum"], "tr": tr}]
+
+def build_tr(raw):
+    """把 (date, nav, cum) 链式复权成 (date, nav, cum, tr)：分红在除息日按当日净值再投资。"""
+    rows = []
+    tr = raw[0][1]
+    rows.append((raw[0][0], raw[0][1], raw[0][2], tr))
     for i in range(1, len(raw)):
-        div = (raw[i]["cum"] - raw[i]["nav"]) - (raw[i - 1]["cum"] - raw[i - 1]["nav"])
-        tr *= (raw[i]["nav"] + max(div, 0.0)) / raw[i - 1]["nav"]
-        rows.append({"date": raw[i]["date"], "nav": raw[i]["nav"], "cum": raw[i]["cum"], "tr": tr})
+        div = (raw[i][2] - raw[i][1]) - (raw[i - 1][2] - raw[i - 1][1])
+        tr *= (raw[i][1] + max(div, 0.0)) / raw[i - 1][1]
+        rows.append((raw[i][0], raw[i][1], raw[i][2], tr))
     return rows
 
 
 def read_csv():
-    out = []
+    """读本地 CSV，返回 [(date, nav, cum)]，按日期去重（同日多行时保留最后一行）。"""
+    uniq = {}
     with CSV_PATH.open(encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
             try:
-                out.append((dt.strptime(r["date"][:10], "%Y-%m-%d"), float(r["tr"])))
+                uniq[dt.strptime(r["date"][:10], "%Y-%m-%d")] = (float(r["nav"]), float(r["cum"]))
             except (ValueError, KeyError):
                 continue
-    return sorted(out)
+    return [(d, nav, cum) for d, (nav, cum) in sorted(uniq.items())]
+
+
+def write_csv(rows):
+    with CSV_PATH.open("w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["date", "nav", "cum", "tr"])
+        for d, nav, cum, tr in rows:
+            w.writerow([d.strftime("%Y-%m-%d"), nav, cum, tr])
 
 
 def load():
-    if CSV_PATH.exists():
-        rows = read_csv()
-        if len(rows) >= 500:
-            return rows
-        print(f"{CSV_PATH.name} 只有 {len(rows)} 行，重新联网抓取 ...")
-    else:
-        print(f"{CSV_PATH.name} 不存在，联网抓取 ...")
+    """读本目录 CSV，并在每次运行时自动检查/补齐最新净值：
 
-    last_err = ""
-    for i in range(3):
-        try:
-            rows = fetch_nav()
-            if len(rows) >= 500:
-                with CSV_PATH.open("w", newline="", encoding="utf-8-sig") as f:
-                    w = csv.DictWriter(f, fieldnames=["date", "nav", "cum", "tr"])
-                    w.writeheader()
-                    w.writerows(rows)
-                print(f"已保存 {CSV_PATH}（{len(rows)} 行）")
-                return read_csv()
-            last_err = f"只取到 {len(rows)} 行"
-        except Exception as e:  # noqa: BLE001
-            last_err = f"{type(e).__name__}: {e}"
-        print(f"  第 {i + 1} 次抓取失败：{last_err}")
-        time.sleep(2)
-    raise SystemExit(f"抓取失败（{last_err}）。请把 {CSV_PATH.name} 放到 {BASE}")
+    - 文件缺失或行数太少  → 全量抓（重试 3 次）
+    - 已有数据            → 抓最近 30 天并合并，然后**从头重算**分红再投资序列
+                            （同时修掉重复行、补上中间缺口）
+    - 联网失败            → 只报警告，继续用本地数据（不会让脚本跑不起来）
+    """
+    local = read_csv() if CSV_PATH.exists() else []
+
+    if len(local) < 500:
+        reason = "不存在" if not local else f"只有 {len(local)} 行"
+        print(f"{CSV_PATH.name} {reason}，全量抓取 ...")
+        last_err = ""
+        for i in range(3):
+            try:
+                raw = fetch_nav_range("2000-01-01", date.today().isoformat())
+                if len(raw) >= 500:
+                    rows = build_tr(raw)
+                    write_csv(rows)
+                    print(f"已保存 {CSV_PATH}（{len(rows)} 行，截至 {rows[-1][0].date()}）")
+                    return rows
+                last_err = f"只取到 {len(raw)} 行"
+            except Exception as e:  # noqa: BLE001
+                last_err = f"{type(e).__name__}: {e}"
+            print(f"  第 {i + 1} 次抓取失败：{last_err}")
+            time.sleep(2)
+        raise SystemExit(f"抓取失败（{last_err}）。请把 {CSV_PATH.name} 放到 {BASE}")
+
+    # —— 增量检查：合并后整条重算，天然去重、补缺口 ——
+    last_d = local[-1][0]
+    try:
+        raw = fetch_nav_range((last_d - timedelta(days=30)).strftime("%Y-%m-%d"),
+                              date.today().isoformat())
+        merged = {d: (nav, cum) for d, nav, cum in local}
+        before = dict(merged)
+        merged.update({d: (nav, cum) for d, nav, cum in raw})
+        added = len([d for d in merged if d not in before])
+        fixed = len(before) - len({d for d in before if d in merged and merged[d] == before[d]})
+        rows = build_tr([(d, nav, cum) for d, (nav, cum) in sorted(merged.items())])
+        write_csv(rows)          # 每次都重写：顺便把重复行/乱序清掉
+        if added == 0 and fixed == 0:
+            print(f"数据已是最新（{last_d.date()}，共 {len(rows)} 行）")
+        else:
+            print(f"数据更新：新增 {added} 个净值日，修正 {fixed} 行，"
+                  f"共 {len(rows)} 行（截至 {rows[-1][0].date()}）")
+        return rows
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠ 联网检查失败（{type(e).__name__}: {e}），改用本地数据，截至 {last_d.date()}")
+        return build_tr(local)
 
 
 def years(a, b):
@@ -152,7 +193,8 @@ def fit_line(xs, ys):
 
 
 def main():
-    data = load()
+    rows = load()
+    data = [(d, tr) for d, _nav, _cum, tr in rows]   # 只用全收益序列画图
     close = dict(data)
     t0 = data[0][0]
     last_date, last_close = data[-1]
