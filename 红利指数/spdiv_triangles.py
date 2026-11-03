@@ -215,6 +215,14 @@ def main():
     gap = (last_close / line_today - 1) * 100
     need = (line_today / last_close - 1) * 100
 
+    # 距离基线（偏离）的历史百分位：逐日算 价格/基线−1，看当前值排在历史的第几百分位
+    # 起点用第一个拟合低点（2018-10），避免把基线外推段也算进分布
+    pct_start = dt.strptime(FIT_LOWS[0], "%Y-%m-%d")
+    dev_hist = [((v * SCALE) / line_at(d) - 1) * 100 for d, v in data if d >= pct_start]
+    pct_rank = 100.0 * sum(1 for x in dev_hist if x <= gap) / len(dev_hist)
+    dev_min, dev_max = min(dev_hist), max(dev_hist)
+    dev_med = sorted(dev_hist)[len(dev_hist) // 2]
+
     x_left = data[0][0] - timedelta(days=30)
     x_right = dt(2028, 6, 30)
 
@@ -280,12 +288,21 @@ def main():
     ax.scatter([last_date], [last_close], s=42, facecolor="white", edgecolor="#6f6f6f",
                zorder=8, linewidth=1.4)
     ax.annotate(f"当前 {last_close:,.0f}（{last_date.date()}）\n"
-                f"较基线 {gap:+.1f}%｜跌到基线还需 {need:.1f}%",
-                xy=(last_date, last_close), xytext=(dt(2026, 11, 20), 2300),
+                f"较基线 {gap:+.1f}%｜历史 {pct_rank:.0f}% 分位\n"
+                f"跌到基线还需 {need:.1f}%",
+                xy=(last_date, last_close), xytext=(dt(2026, 11, 20), 2320),
                 textcoords="data", fontsize=8.0, color="#3a3a3a", ha="left", va="center", zorder=9,
                 linespacing=1.4,
                 bbox=dict(boxstyle="round,pad=0.35", fc="white", ec="#c9d3df", lw=0.8),
                 arrowprops=dict(arrowstyle="-", color="#c9c9c9", lw=0.8, shrinkA=2, shrinkB=4))
+
+    # 偏离分位的说明（右下角空白处）
+    ax.text(0.60, 0.035,
+            f"偏离分位（{pct_start.strftime('%Y-%m')} 起）：逐日算「价格/基线−1」，"
+            f"当前 {gap:+.1f}% 排在 {pct_rank:.0f}% 分位\n"
+            f"（历史区间 {dev_min:+.0f}% ~ {dev_max:+.0f}%，中位 {dev_med:+.0f}%）",
+            transform=ax.transAxes, fontsize=7.6, color="#7a7a7a", ha="left", va="bottom",
+            zorder=9, linespacing=1.4)
 
     ax.set_yscale("log")
     ax.set_ylim(720, 2600)
