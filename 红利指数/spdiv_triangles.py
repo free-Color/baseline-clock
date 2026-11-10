@@ -223,8 +223,14 @@ def main():
     dev_min, dev_max = min(dev_hist), max(dev_hist)
     dev_med = sorted(dev_hist)[len(dev_hist) // 2]
 
+    # 被套时间：价格原地不动，基线要涨多久才追上现价
+    t_years = math.log(last_close / line_today) / b if last_close > line_today else 0.0
+    catch_date = last_date + timedelta(days=int(round(t_years * 365.25)))
+    catch_months = t_years * 12
+    catch_price = line_at(catch_date)
+
     x_left = data[0][0] - timedelta(days=30)
-    x_right = dt(2028, 6, 30)
+    x_right = dt(2028, 12, 31)
 
     fig, ax = plt.subplots(figsize=(15, 8.4))
     fig.subplots_adjust(left=0.065, right=0.985, top=0.845, bottom=0.10)
@@ -289,12 +295,22 @@ def main():
                zorder=8, linewidth=1.4)
     ax.annotate(f"当前 {last_close:,.0f}（{last_date.date()}）\n"
                 f"较基线 {gap:+.1f}%｜历史 {pct_rank:.0f}% 分位\n"
-                f"跌到基线还需 {need:.1f}%",
-                xy=(last_date, last_close), xytext=(dt(2026, 11, 20), 2320),
+                f"跌到基线还需 {need:.1f}%\n"
+                f"价格不动约 {catch_months:.0f} 个月追平（{catch_date.strftime('%Y-%m')}）",
+                xy=(last_date, last_close), xytext=(dt(2026, 11, 20), 2330),
                 textcoords="data", fontsize=8.0, color="#3a3a3a", ha="left", va="center", zorder=9,
                 linespacing=1.4,
                 bbox=dict(boxstyle="round,pad=0.35", fc="white", ec="#c9d3df", lw=0.8),
                 arrowprops=dict(arrowstyle="-", color="#c9c9c9", lw=0.8, shrinkA=2, shrinkB=4))
+
+    # 被套时间：从现价画一条水平虚线到基线追平的位置
+    ax.plot([last_date, catch_date], [last_close, last_close], color="#9aa0a6", lw=1.0,
+            ls=(0, (2, 3)), zorder=6)
+    ax.scatter([catch_date], [catch_price], s=46, marker="D", facecolor="white",
+               edgecolor=C_FIT, linewidth=1.4, zorder=8)
+    ax.text(catch_date + timedelta(days=10), catch_price * 0.955,
+            f"基线追平 {catch_date.strftime('%Y-%m')}", fontsize=7.6, color=C_FIT,
+            ha="left", va="top", zorder=9)
 
     # 偏离分位的说明（右下角空白处）
     ax.text(0.60, 0.035,

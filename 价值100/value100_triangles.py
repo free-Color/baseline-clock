@@ -8,6 +8,7 @@
 2022-10-31(2488) → 2026-03-12(4965) → 2026-06-30(4118，未确认)
 
 基线：7 个回撤低点的对数线性拟合（剔除 2013-06-27、2015-02-06 两个最偏离点），年化约 +10.5%。
+图上另标注：当前价相对基线的偏离及其历史分位、以及「价格不动、基线多久追上现价」的被套时间。
 
 依赖：matplotlib。数据：同目录 cni_980081_daily.csv。
 运行：python value100_triangles.py
@@ -201,6 +202,20 @@ def main():
     gap = (last_close / line_today - 1) * 100
     drop_to_line = (line_today / last_close - 1) * 100
 
+    # 距离基线（偏离）的历史百分位：逐日算 价格/基线−1，看当前值排在历史的第几百分位
+    # 起点用第一个拟合低点（2016-01），避免把基线外推段也算进分布
+    pct_start = dt.strptime(FIT_LOWS[0], "%Y-%m-%d")
+    dev_hist = [(v / line_at(d) - 1) * 100 for d, v in data if d >= pct_start]
+    pct_rank = 100.0 * sum(1 for x in dev_hist if x <= gap) / len(dev_hist)
+    dev_min, dev_max = min(dev_hist), max(dev_hist)
+    dev_med = sorted(dev_hist)[len(dev_hist) // 2]
+
+    # 被套时间：价格原地不动，基线要涨多久才追上现价
+    t_years = math.log(last_close / line_today) / b if last_close > line_today else 0.0
+    catch_date = last_date + timedelta(days=int(round(t_years * 365.25)))
+    catch_months = t_years * 12
+    catch_price = line_at(catch_date)
+
     x_left = data[0][0] - timedelta(days=45)
     x_right = dt(2028, 12, 31)
 
@@ -280,12 +295,31 @@ def main():
     ax.scatter([last_date], [last_close], s=42, facecolor="white", edgecolor="#6f6f6f",
                zorder=8, linewidth=1.4)
     ax.annotate(f"当前 {last_close:,.0f}（{last_date.date()}）\n"
-                f"较基线 +{gap:.1f}%｜跌到基线还需 {drop_to_line:.1f}%",
-                xy=(last_date, last_close), xytext=(dt(2027, 2, 1), 5050),
+                f"较基线 {gap:+.1f}%｜历史 {pct_rank:.0f}% 分位\n"
+                f"跌到基线还需 {drop_to_line:.1f}%\n"
+                f"价格不动约 {catch_months:.0f} 个月追平（{catch_date.strftime('%Y-%m')}）",
+                xy=(last_date, last_close), xytext=(dt(2026, 12, 20), 5400),
                 textcoords="data", fontsize=8.0, color="#3a3a3a", ha="left", va="center", zorder=9,
                 linespacing=1.4,
                 bbox=dict(boxstyle="round,pad=0.35", fc="white", ec="#c9d3df", lw=0.8),
                 arrowprops=dict(arrowstyle="-", color="#c9c9c9", lw=0.8, shrinkA=2, shrinkB=4))
+
+    # 被套时间：从现价画一条水平虚线到基线追平的位置
+    ax.plot([last_date, catch_date], [last_close, last_close], color="#9aa0a6", lw=1.0,
+            ls=(0, (2, 3)), zorder=6)
+    ax.scatter([catch_date], [catch_price], s=46, marker="D", facecolor="white",
+               edgecolor=C_FIT, linewidth=1.4, zorder=8)
+    ax.text(catch_date + timedelta(days=10), catch_price * 0.955,
+            f"基线追平 {catch_date.strftime('%Y-%m')}", fontsize=7.6, color=C_FIT,
+            ha="left", va="top", zorder=9)
+
+    # 偏离分位的说明（右下角空白处）
+    ax.text(0.60, 0.035,
+            f"偏离分位（{pct_start.strftime('%Y-%m')} 起）：逐日算「价格/基线−1」，"
+            f"当前 {gap:+.1f}% 排在 {pct_rank:.0f}% 分位\n"
+            f"（历史区间 {dev_min:+.0f}% ~ {dev_max:+.0f}%，中位 {dev_med:+.0f}%）",
+            transform=ax.transAxes, fontsize=7.6, color="#7a7a7a", ha="left", va="bottom",
+            zorder=9, linespacing=1.4)
 
     ax.set_yscale("log")
     ax.set_ylim(700, 6200)
@@ -322,7 +356,8 @@ def main():
     fig.savefig(PNG, facecolor="white")
     fig.savefig(PDF, facecolor="white")
     print(f"saved {PNG.name} / {PDF.name}")
-    print(f"基线年化 {ann:.2f}%｜当前 {last_close:.2f}，较基线 {gap:+.1f}%")
+    print(f"基线年化 {ann:.2f}%｜当前 {last_close:.2f}，较基线 {gap:+.1f}%（历史 {pct_rank:.0f}% 分位），"
+          f"跌到基线 {drop_to_line:.1f}%，价格不动 {catch_months:.0f} 个月追平（{catch_date.strftime('%Y-%m')}）")
 
 
 if __name__ == "__main__":
