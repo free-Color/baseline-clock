@@ -15,7 +15,7 @@ import math
 import time
 import urllib.parse
 import urllib.request
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import matplotlib
@@ -61,6 +61,10 @@ LEG6_POS = (datetime(2027, 7, 1), 11100)
 
 API = "http://hq.cnindex.com.cn/market/market/getIndexDailyDataWithDataFormat"
 
+# 实时点位（东财，secid 0.980080；f43=现价×100，f86=时间戳秒）
+QUOTE_API = "https://push2.eastmoney.com/api/qt/stock/get"
+QUOTE_SECID = "0.980080"
+
 
 def fetch_range(start, end):
     """抓 [start, end] 的日线，返回 [(datetime, close)]；网络异常直接抛出。"""
@@ -80,6 +84,46 @@ def fetch_full():
     rows = fetch_range("2000-01-01", today)
     rows += fetch_range((date.today() - timedelta(days=60)).isoformat(), today)
     return sorted(dict(rows).items())
+
+
+def fetch_live():
+    """东财实时点位，返回 (date, price, hhmm)；失败抛异常。"""
+    q = urllib.parse.urlencode({"secid": QUOTE_SECID, "fields": "f43,f60,f86,f58"})
+    req = urllib.request.Request(f"{QUOTE_API}?{q}", headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        d = json.loads(r.read().decode("utf-8"))
+    node = d.get("data") or {}
+    if not node.get("f43"):
+        raise ValueError("实时接口无数据")
+    price = float(node["f43"]) / 100.0
+    t = datetime.fromtimestamp(int(node["f86"]), timezone.utc) + timedelta(hours=8)  # 接口给北京时间
+    return t.date(), price, t.strftime("%H%M")
+
+
+def fill_live(rows):
+    """日线还没更新到当天时，用实时点位把序列顺延到当天。
+
+    只追加“当天”这一根；中间缺的交易日由 load() 的日线增量补齐。
+    返回 (rows, live_info or None)。
+    """
+    last_d = rows[-1][0].date()
+    try:
+        qd, qp, qt = fetch_live()
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠ 实时点位获取失败（{type(e).__name__}: {e}），只用日线")
+        return rows, None
+    if qd <= last_d or qp <= 0:
+        return rows, None
+    if (qd - last_d).days > 5:
+        print(f"⚠ 日线停在 {last_d}，实时已是 {qd}（隔 {(qd - last_d).days} 天），跳过顺延，先补日线")
+        return rows, None
+
+    out = list(rows) + [(datetime(qd.year, qd.month, qd.day), qp)]
+    live = {"date": qd, "price": qp, "time": qt, "nav_date": last_d,
+            "days": 1, "intraday": qt < "1500"}
+    tag = "盘中" if live["intraday"] else "收盘价（日线未出）"
+    print(f"日线截至 {last_d}，用实时点位顺延 1 天：{qd} {tag} {qp:,.2f}")
+    return out, live
 
 
 def read_csv():
@@ -167,11 +211,12 @@ def fit_line(xs, ys):
 
 
 def main():
-    data = load()
+    data, live = fill_live(load())
     if len(data) < 100:
         raise SystemExit("数据太少，检查 cni_980080_daily.csv")
     t0 = data[0][0]
     last_date, last_close = data[-1]
+    cur_tag = "｜盘中" if (live and live["intraday"]) else ""
 
     turns = []
     for ds, kind in TURNS:
@@ -281,12 +326,14 @@ def main():
                     bbox=dict(boxstyle="round,pad=0.3", fc="#fdf6ee", ec="#dcc3a3",
                               lw=0.7, alpha=0.95))
 
-    # 当前点位
+    # 当前点位（位置随现价自适应，不再写死坐标）
     ax.scatter([last_date], [last_close], s=44, facecolor="white", edgecolor="#6f6f6f",
                zorder=8, linewidth=1.4)
-    ax.annotate(f"当前 {last_close:,.0f}（{last_date.date()}）\n"
-                f"较基线 +{gap:.0f}%｜本轮 {(last_close / turns[-1][1] - 1) * 100:.1f}%",
-                xy=(last_date, last_close), xytext=(datetime(2026, 11, 25), 15600),
+    label_x = last_date + timedelta(days=12)
+    label_y = max(last_close * 1.55, 15000)
+    ax.annotate(f"当前 {last_close:,.0f}（{last_date.date()}）{cur_tag}\n"
+                f"较基线 {gap:+.0f}%｜本轮 {(last_close / turns[-1][1] - 1) * 100:.1f}%",
+                xy=(last_date, last_close), xytext=(label_x, label_y),
                 textcoords="data", fontsize=8.3, color="#3a3a3a", ha="left", va="center", zorder=9,
                 linespacing=1.5,
                 bbox=dict(boxstyle="round,pad=0.4", fc="white", ec="#c9d3df", lw=0.8),
@@ -314,9 +361,10 @@ def main():
     ax.set_ylabel("指数点位（对数坐标）", fontsize=10.5, color=C_TXT, labelpad=10)
     ax.set_title("国证成长100指数（980080）：沿基线上行的三个三角形，第三个尚未走完",
                  fontsize=16, color="#1f4e79", fontweight="bold", loc="left", pad=40)
+    live_note = "｜当日为盘中实时点位，收盘后以日线为准" if (live and live["intraday"]) else ""
     ax.text(0.0, 1.02,
             f"{data[0][0].date()} ~ {last_date.date()}｜底→顶→底 用虚线连接，第三个三角形的下行边按"
-            f"“再跌 2 年、−20%”推演｜虚线为周期示意、非价格路径｜基线年化 +{ann:.1f}%",
+            f"“再跌 2 年、−20%”推演｜虚线为周期示意、非价格路径｜基线年化 +{ann:.1f}%{live_note}",
             transform=ax.transAxes, fontsize=9.0, color="#5a5a5a")
     ax.legend(loc="upper left", fontsize=8.9, frameon=True, framealpha=0.95,
               edgecolor="#cfcfcf", borderpad=0.7)
