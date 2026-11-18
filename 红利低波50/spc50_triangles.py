@@ -341,9 +341,6 @@ def main():
         d, v, _ = turns[idx]
         if j == 0:
             txt = f"{d.date()}　{v:,.0f}\n2020 疫情底（成立以来最低）"
-        elif j == 3:
-            loss = (v / turns[idx - 1][1] - 1) * 100
-            txt = f"{d.date()}　{v:,.0f}\n↓ {loss:.1f}%（未确认）"
         else:
             loss = (v / turns[idx - 1][1] - 1) * 100
             txt = f"{d.date()}　{v:,.0f}\n↓ {loss:.1f}%"
