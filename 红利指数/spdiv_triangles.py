@@ -5,9 +5,16 @@
 （累计净值 = 单位净值 + 累计分红，近似红利再投资的总收益），序列从 2017-01-19 起。
 为便于阅读，净值 ×1000 画图（2017-01-19 = 1000）。
 
-画法与价值100一致：对数坐标、大底基线、底→顶→底虚线三角形、每轮下跌背景色。
+当日净值一般收盘后晚上才出，所以净值序列没更新到今天时，用跟踪**同一指数**的
+「标普A股红利ETF华宝（562060）」的**成交价**（腾讯前复权日线，当日那根实时滚动）
+把序列顺延到当天，盘中即可看到点位；501029 自身成交太薄，只作兜底。
+注意 562060 单价约 0.62 元、一跳 0.001 元 ≈ 0.16%，盘中顺延的点有 ~0.1% 量级的
+报价噪声（真实净值出来后会被覆盖）。
 
-依赖：matplotlib。数据：同目录 spdiv_501029_nav.csv（缺失自动联网抓取）。
+画法与价值100一致：对数坐标、大底基线、底→顶→底虚线三角形、每轮下跌背景色，
+外加「偏离历史分位」与「追平时间」（价格不动、基线多久追上现价）。
+
+依赖：matplotlib。数据：同目录 spdiv_501029_tr.csv（缺失自动联网抓取）。
 运行：python spdiv_triangles.py
 输出：同目录 标普红利_三角形周期.png / .pdf
 """
@@ -69,9 +76,14 @@ BOT_POS = [(20, -18), (-20, -26), (-20, -28), (20, -26)]
 
 NAV_URL = "https://stock.finance.sina.com.cn/fundInfo/api/openapi.php/CaihuiFundInfoService.getNav"
 HEADERS = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn"}
+SYMBOL = "501029"   # 净值序列来源
+
+# 盘中顺延用的成交价代理（按优先级）：562060 是跟踪同一指数的 ETF，成交价连续；
+# 501029 是 LOF，成交太薄，只在 562060 取不到 / 覆盖不到时兜底。
+LIVE_PROXIES = [("sh562060", "562060"), ("sh501029", "501029")]
 
 
-def fetch_nav_range(start, end, symbol="501029"):
+def fetch_nav_range(start, end, symbol=SYMBOL):
     """抓 [start, end] 的单位净值 + 累计净值，返回 [(date, nav, cum)]，按日期升序。"""
     raw, page = [], 1
     while True:
@@ -127,13 +139,99 @@ def write_csv(rows):
             w.writerow([d.strftime("%Y-%m-%d"), nav, cum, tr])
 
 
+def fetch_recent_closes(symbol_tx, count=250):
+    """腾讯前复权日线（当日那根随盘中滚动），返回 [(date, close)] 升序。"""
+    url = (f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+           f"?param={symbol_tx},day,,,{count},qfq")
+    req = urllib.request.Request(url, headers=HEADERS)
+    with urllib.request.urlopen(req, timeout=25) as r:
+        payload = json.loads(r.read().decode("utf-8"))
+    node = payload["data"][symbol_tx]
+    bars = node.get("qfqday") or node.get("day") or []
+    out = [(dt.strptime(b[0][:10], "%Y-%m-%d").date(), float(b[2])) for b in bars]
+    return sorted((d, c) for d, c in out if c > 0)
+
+
+def fetch_quote(symbol_tx):
+    """最新成交：返回 (date, price, hhmm)。"""
+    req = urllib.request.Request(f"https://qt.gtimg.cn/q={symbol_tx}",
+                                 headers={**HEADERS, "Referer": "https://finance.sina.com.cn"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        txt = r.read().decode("gbk", "ignore")
+    f = txt.split('"')[1].split("~")
+    return dt.strptime(f[30][:8], "%Y%m%d").date(), float(f[3]), f[30][8:12]
+
+
+def fill_live(rows):
+    """净值还没更新到当天时，用跟踪同一指数的 ETF 成交价把全收益序列顺延到当天。
+
+    做法：以最后一个净值日（或之前最近一根）的成交价为基准，逐日累乘成交价涨幅；
+    前复权已含分红，口径与净值序列一致。返回 (rows, live_info or None)。
+    """
+    last_d = rows[-1][0]
+    last_d = last_d.date() if hasattr(last_d, "date") else last_d
+
+    used, bars = None, []
+    for symbol_tx, label in LIVE_PROXIES:
+        try:
+            bars = fetch_recent_closes(symbol_tx)
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠ {label} 成交价获取失败（{type(e).__name__}: {e}）")
+            continue
+        if bars and bars[0][0] <= last_d:
+            used = (symbol_tx, label)
+            break
+        first = bars[0][0] if bars else "无数据"
+        print(f"⚠ {label} 成交价未覆盖 {last_d}（最早 {first}），换下一个代理")
+
+    if used is None:
+        print("⚠ 没有可用的成交价代理，只用净值")
+        return rows, None
+    if bars[-1][0] <= last_d:
+        return rows, None
+
+    base = start = None
+    for i, (d, c) in enumerate(bars):
+        if d <= last_d:
+            base, start = c, i
+    if base is None:
+        print("⚠ 成交价序列未覆盖最后一个净值日，跳过顺延")
+        return rows, None
+
+    out = list(rows)
+    for d, c in bars[start + 1:]:
+        r = c / base - 1
+        _, pn, pc, pt = out[-1]
+        out.append((dt.combine(d, dt.min.time()), pn * (1 + r), pc + max(pn * r, 0.0), pt * (1 + r)))
+        base = c
+
+    symbol_tx, label = used
+    last_row = out[-1][0]
+    last_row = last_row.date() if hasattr(last_row, "date") else last_row
+    try:
+        qd, qp, qt = fetch_quote(symbol_tx)
+    except Exception:  # noqa: BLE001
+        qd, qp, qt = last_row, 0.0, ""
+    if qd != last_row:
+        qp, qt = 0.0, ""
+
+    live = {"date": last_row, "price": qp, "time": qt, "proxy": label,
+            "used": bars[-1][1], "nav_date": last_d, "days": len(out) - len(rows),
+            "intraday": bool(qt) and qt < "1500"}
+    tag = "盘中" if live["intraday"] else "收盘价（净值未出）"
+    print(f"净值截至 {last_d}，用 {label} 成交价顺延 {live['days']} 天："
+          f"{live['date']} {tag} {out[-1][3] * SCALE:,.0f}")
+    return out, live
+
+
 def load():
-    """读本目录 CSV，并在每次运行时自动检查/补齐最新净值：
+    """读本目录 CSV，自动检查/补齐最新净值；净值没到今天就用成交价顺延。
 
     - 文件缺失或行数太少  → 全量抓（重试 3 次）
     - 已有数据            → 抓最近 30 天并合并，然后**从头重算**分红再投资序列
                             （同时修掉重复行、补上中间缺口）
     - 联网失败            → 只报警告，继续用本地数据（不会让脚本跑不起来）
+    - 净值未更新到当天    → 用 562060 的成交价把序列顺延到当天（返回 live 信息）
     """
     local = read_csv() if CSV_PATH.exists() else []
 
@@ -147,8 +245,8 @@ def load():
                 if len(raw) >= 500:
                     rows = build_tr(raw)
                     write_csv(rows)
-                    print(f"已保存 {CSV_PATH}（{len(rows)} 行，截至 {rows[-1][0].date()}）")
-                    return rows
+                    print(f"已保存 {CSV_PATH.name}（{len(rows)} 行，截至 {rows[-1][0].date()}）")
+                    return fill_live(rows)
                 last_err = f"只取到 {len(raw)} 行"
             except Exception as e:  # noqa: BLE001
                 last_err = f"{type(e).__name__}: {e}"
@@ -173,10 +271,11 @@ def load():
         else:
             print(f"数据更新：新增 {added} 个净值日，修正 {fixed} 行，"
                   f"共 {len(rows)} 行（截至 {rows[-1][0].date()}）")
-        return rows
+        return fill_live(rows)
     except Exception as e:  # noqa: BLE001
         print(f"⚠ 联网检查失败（{type(e).__name__}: {e}），改用本地数据，截至 {last_d.date()}")
-        return build_tr(local)
+        rows = build_tr(local)
+    return fill_live(rows)
 
 
 def years(a, b):
@@ -193,7 +292,7 @@ def fit_line(xs, ys):
 
 
 def main():
-    rows = load()
+    rows, live = load()
     data = [(d, tr) for d, _nav, _cum, tr in rows]   # 只用全收益序列画图
     close = dict(data)
     t0 = data[0][0]
@@ -241,6 +340,12 @@ def main():
 
     ax.plot([d for d, _ in data], [c * SCALE for _, c in data], color=C_LINE, lw=1.15,
             zorder=3, label="标普A股红利（全收益：分红再投资，501029 ×1000）")
+
+    # 净值未更新到今天时，最后一段按当日成交价顺延（橙色虚线 + 空心点）
+    if live:
+        prev_d, prev_v = data[-2]
+        ax.plot([prev_d, last_date], [prev_v * SCALE, last_close], color="#e07b00", lw=1.2,
+                ls=(0, (3, 2)), zorder=3.4)
 
     ax.plot([t[0] for t in turns], [t[1] for t in turns], color=C_ZIG, lw=1.15,
             ls=(0, (5, 3)), zorder=2.6, alpha=0.9)
@@ -291,12 +396,25 @@ def main():
                 fontsize=7.8, color="#4a4a4a", ha="center", va="center", zorder=7,
                 bbox=dict(boxstyle="round,pad=0.26", fc="#f7f9fc", ec="#cdd8e6", lw=0.7, alpha=0.95))
 
-    ax.scatter([last_date], [last_close], s=42, facecolor="white", edgecolor="#6f6f6f",
-               zorder=8, linewidth=1.4)
-    ax.annotate(f"当前 {last_close:,.0f}（{last_date.date()}）\n"
-                f"较基线 {gap:+.1f}%｜历史 {pct_rank:.0f}% 分位\n"
-                f"跌到基线还需 {need:.1f}%\n"
-                f"价格不动约 {catch_months:.0f} 个月追平（{catch_date.strftime('%Y-%m')}）",
+    pt_color = "#e07b00" if live else "#6f6f6f"
+    ax.scatter([last_date], [last_close], s=42, facecolor="white", edgecolor=pt_color,
+               zorder=8, linewidth=1.5)
+    stamp = last_date.strftime("%Y-%m-%d")
+    if live:
+        stamp += " 盘中" if live["intraday"] else " 净值未出"
+    if last_close > line_today:
+        extra = (f"跌到基线还需 {abs(need):.1f}%\n"
+                 f"价格不动约 {catch_months:.0f} 个月追平（{catch_date.strftime('%Y-%m')}）")
+    else:
+        extra = f"回到基线还需 {need:.1f}%（已在基线下方，不必等追平）"
+    if live:
+        if live["intraday"]:
+            extra += f"\n末点按 {live['proxy']} 盘中 {live['price']:.3f} 折算"
+        else:
+            extra += f"\n末点按 {live['proxy']} 收盘 {live['used']:.3f} 折算（净值未出）"
+
+    ax.annotate(f"当前 {last_close:,.0f}（{stamp}）\n"
+                f"较基线 {gap:+.1f}%｜历史 {pct_rank:.0f}% 分位\n{extra}",
                 xy=(last_date, last_close), xytext=(dt(2026, 11, 20), 2330),
                 textcoords="data", fontsize=8.0, color="#3a3a3a", ha="left", va="center", zorder=9,
                 linespacing=1.4,
@@ -304,13 +422,14 @@ def main():
                 arrowprops=dict(arrowstyle="-", color="#c9c9c9", lw=0.8, shrinkA=2, shrinkB=4))
 
     # 被套时间：从现价画一条水平虚线到基线追平的位置
-    ax.plot([last_date, catch_date], [last_close, last_close], color="#9aa0a6", lw=1.0,
-            ls=(0, (2, 3)), zorder=6)
-    ax.scatter([catch_date], [catch_price], s=46, marker="D", facecolor="white",
-               edgecolor=C_FIT, linewidth=1.4, zorder=8)
-    ax.text(catch_date + timedelta(days=10), catch_price * 0.955,
-            f"基线追平 {catch_date.strftime('%Y-%m')}", fontsize=7.6, color=C_FIT,
-            ha="left", va="top", zorder=9)
+    if last_close > line_today:
+        ax.plot([last_date, catch_date], [last_close, last_close], color="#9aa0a6", lw=1.0,
+                ls=(0, (2, 3)), zorder=6)
+        ax.scatter([catch_date], [catch_price], s=46, marker="D", facecolor="white",
+                   edgecolor=C_FIT, linewidth=1.4, zorder=8)
+        ax.text(catch_date + timedelta(days=10), catch_price * 0.955,
+                f"基线追平 {catch_date.strftime('%Y-%m')}", fontsize=7.6, color=C_FIT,
+                ha="left", va="top", zorder=9)
 
     # 偏离分位的说明（右下角空白处）
     ax.text(0.60, 0.035,
@@ -344,19 +463,25 @@ def main():
                  fontsize=16, color="#1f4e79", fontweight="bold", loc="left", pad=40)
     ax.text(0.0, 1.02,
             f"{data[0][0].date()} ~ {last_date.date()}｜以 501029 的「分红在除息日再投资」序列为全收益代理（×1000）"
-            f"｜底→顶→底 虚线连接｜基线年化 +{ann:.1f}%",
+            + (f"｜末点按 {live['proxy']} 成交价顺延" if live else "")
+            + f"｜底→顶→底 虚线连接｜基线年化 +{ann:.1f}%",
             transform=ax.transAxes, fontsize=9.0, color="#5a5a5a")
     ax.legend(loc="upper left", fontsize=8.8, frameon=True, framealpha=0.95,
               edgecolor="#cfcfcf", borderpad=0.7)
 
     fig.text(0.065, 0.024,
-             "数据来源：新浪财经基金净值（501029，分红再投资复权）　·　绘图：Python / Matplotlib",
+             "数据来源：新浪财经基金净值（501029，分红再投资复权）"
+             "＋ 腾讯行情 562060 成交价（净值未出时盘中顺延，一跳 ≈0.16%）"
+             "　·　绘图：Python / Matplotlib",
              fontsize=8.4, color="#7a7a7a")
 
     fig.savefig(PNG, facecolor="white")
     fig.savefig(PDF, facecolor="white")
     print(f"saved {PNG.name} / {PDF.name}")
-    print(f"年化 {ann:.2f}%｜当前 {last_close:.0f}，较基线 {gap:+.1f}%，跌到基线 {need:.1f}%")
+    live_note = f"｜末点 {live['date']} 按 {live['proxy']} 成交价顺延" if live else "｜末点是官方净值"
+    where = (f"跌到基线 {abs(need):.1f}%" if last_close > line_today
+             else f"基线下方 {abs(need):.1f}%")
+    print(f"年化 {ann:.2f}%｜当前 {last_close:.0f}，较基线 {gap:+.1f}%，{where}{live_note}")
 
 
 if __name__ == "__main__":
