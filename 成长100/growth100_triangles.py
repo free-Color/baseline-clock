@@ -41,8 +41,7 @@ plt.rcParams.update({
 # 三个三角形的转折点（底/顶交替），最后一个是推演底
 TURNS = [("2013-06-25", "low"), ("2015-06-12", "high"), ("2019-01-03", "low"),
          ("2021-09-15", "high"), ("2024-02-05", "low"), ("2026-06-22", "high")]
-PROJ_DAYS = int(2 * 365.25)   # 再跌两年
-PROJ_RET = 0.80               # 再跌 20%
+PROJ_DAYS = float(2.4 * 365.25)   # 再跌两年
 
 C_LINE = "#2f5d8a"
 C_RED = "#c00000"
@@ -61,9 +60,13 @@ LEG6_POS = (datetime(2027, 7, 1), 11100)
 
 API = "http://hq.cnindex.com.cn/market/market/getIndexDailyDataWithDataFormat"
 
-# 实时点位（东财，secid 0.980080；f43=现价×100，f86=时间戳秒）
-QUOTE_API = "https://push2.eastmoney.com/api/qt/stock/get"
-QUOTE_SECID = "0.980080"
+# 实时点位：腾讯行情（qt.gtimg.cn，GBK 文本）。
+# 980080 是国证自有编码，腾讯只覆盖交易所挂牌的指数（399xxx），没有 980080；
+# 因此用跟踪同一指数的 易方达国证成长100ETF（159259，简称“成长ETF易方达”）的当日涨跌幅
+# 折算成指数点位：今日点位 ≈ 最后一个收盘 × (1 + ETF 涨跌幅)。日线口径仍是国证官网收盘。
+QUOTE_SYMBOL = "sz159259"
+QUOTE_URL = "https://qt.gtimg.cn/q=" + QUOTE_SYMBOL
+QUOTE_HEADERS = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn"}
 
 
 def fetch_range(start, end):
@@ -86,43 +89,52 @@ def fetch_full():
     return sorted(dict(rows).items())
 
 
-def fetch_live():
-    """东财实时点位，返回 (date, price, hhmm)；失败抛异常。"""
-    q = urllib.parse.urlencode({"secid": QUOTE_SECID, "fields": "f43,f60,f86,f58"})
-    req = urllib.request.Request(f"{QUOTE_API}?{q}", headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=20) as r:
-        d = json.loads(r.read().decode("utf-8"))
-    node = d.get("data") or {}
-    if not node.get("f43"):
-        raise ValueError("实时接口无数据")
-    price = float(node["f43"]) / 100.0
-    t = datetime.fromtimestamp(int(node["f86"]), timezone.utc) + timedelta(hours=8)  # 接口给北京时间
-    return t.date(), price, t.strftime("%H%M")
+def fetch_quote():
+    """腾讯实时行情（ETF 代理），返回 (date, price, prev_close, hhmm)；失败抛异常。
+
+    字段（~ 分隔）：3=现价、4=昨收、30=时间戳 yyyyMMddHHmmss。
+    """
+    req = urllib.request.Request(QUOTE_URL, headers=QUOTE_HEADERS)
+    with urllib.request.urlopen(req, timeout=15) as r:
+        txt = r.read().decode("gbk", "ignore")
+    if '"' not in txt:
+        raise ValueError("腾讯接口无数据")
+    f = txt.split('"')[1].split("~")
+    if len(f) < 33 or not f[3] or not f[4]:
+        raise ValueError("腾讯接口无数据")
+    price, prev = float(f[3]), float(f[4])
+    if price <= 0 or prev <= 0:
+        raise ValueError("腾讯行情价格异常")
+    d = datetime.strptime(f[30][:8], "%Y%m%d").date()
+    return d, price, prev, f[30][8:12]
 
 
 def fill_live(rows):
-    """日线还没更新到当天时，用实时点位把序列顺延到当天。
+    """日线还没更新到当天时，用腾讯行情（ETF 涨跌幅）把序列顺延到当天。
 
     只追加“当天”这一根；中间缺的交易日由 load() 的日线增量补齐。
     返回 (rows, live_info or None)。
     """
-    last_d = rows[-1][0].date()
+    last_d, last_close = rows[-1][0].date(), rows[-1][1]
     try:
-        qd, qp, qt = fetch_live()
+        qd, etf, prev, qt = fetch_quote()
     except Exception as e:  # noqa: BLE001
-        print(f"⚠ 实时点位获取失败（{type(e).__name__}: {e}），只用日线")
+        print(f"[警告] 实时点位获取失败（{type(e).__name__}: {e}），只用日线")
         return rows, None
-    if qd <= last_d or qp <= 0:
+    if qd <= last_d:
         return rows, None
     if (qd - last_d).days > 5:
-        print(f"⚠ 日线停在 {last_d}，实时已是 {qd}（隔 {(qd - last_d).days} 天），跳过顺延，先补日线")
+        print(f"[警告] 日线停在 {last_d}，实时已是 {qd}（隔 {(qd - last_d).days} 天），跳过顺延，先补日线")
         return rows, None
 
+    chg = etf / prev - 1
+    qp = last_close * (1 + chg)          # ETF 涨跌幅折算成指数点位
     out = list(rows) + [(datetime(qd.year, qd.month, qd.day), qp)]
     live = {"date": qd, "price": qp, "time": qt, "nav_date": last_d,
-            "days": 1, "intraday": qt < "1500"}
+            "days": 1, "intraday": qt < "1500", "proxy": QUOTE_SYMBOL[-6:]}
     tag = "盘中" if live["intraday"] else "收盘价（日线未出）"
-    print(f"日线截至 {last_d}，用实时点位顺延 1 天：{qd} {tag} {qp:,.2f}")
+    print(f"日线截至 {last_d}，用腾讯 {QUOTE_SYMBOL[-6:]} {etf:.3f}（{chg:+.2%}）折算，"
+          f"顺延 1 天：{qd} {tag} {qp:,.2f}")
     return out, live
 
 
@@ -191,7 +203,7 @@ def load():
             print(f"数据已是最新（{last_date_local.date()}，共 {len(rows)} 行）")
         return rows
     except Exception as e:  # noqa: BLE001
-        print(f"⚠ 联网检查失败（{type(e).__name__}: {e}），改用本地数据，截至 {last_date_local.date()}")
+        print(f"[警告] 联网检查失败（{type(e).__name__}: {e}），改用本地数据，截至 {last_date_local.date()}")
         return local
 
 
@@ -237,8 +249,7 @@ def main():
     gap = (last_close / line_today - 1) * 100
 
     proj_date = last_date + timedelta(days=PROJ_DAYS)
-    proj_price = last_close * PROJ_RET
-    line_proj = line_at(proj_date)
+    proj_price = line_at(proj_date)
 
     x_left = data[0][0] - timedelta(days=45)
     x_right = datetime(2029, 6, 30)
@@ -369,14 +380,14 @@ def main():
     ax.legend(loc="upper left", fontsize=8.9, frameon=True, framealpha=0.95,
               edgecolor="#cfcfcf", borderpad=0.7)
 
-    fig.text(0.065, 0.024, "数据来源：国证指数网（cnindex.com.cn）官方日行情　·　绘图：Python / Matplotlib",
+    fig.text(0.065, 0.024, "数据来源：国证指数网（cnindex.com.cn）官方日行情　·　盘中顺延按腾讯行情 159259 折算　·　绘图：Python / Matplotlib",
              fontsize=8.4, color="#7a7a7a")
 
     fig.savefig(PNG, facecolor="white")
     fig.savefig(PDF, facecolor="white")
     print(f"saved {PNG.name} / {PDF.name}")
     print(f"基线年化 {ann:.2f}%｜当前 {last_close:.2f}，较基线 {gap:+.1f}%")
-    print(f"推演底 {proj_date.date()} 约 {proj_price:.0f}，基线届时 {line_proj:.0f}")
+    print(f"推演底 {proj_date.date()} 约 {proj_price:.0f}，基线届时 {proj_price:.0f}")
 
 
 if __name__ == "__main__":
