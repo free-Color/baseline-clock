@@ -33,8 +33,8 @@ from matplotlib.ticker import FixedLocator, FuncFormatter, LogLocator, NullForma
 
 BASE = Path(__file__).resolve().parent
 CSV_PATH = BASE / "spc50_515450_tr.csv"
-PNG = BASE / "标普大盘红利50_三角形周期.png"
-PDF = BASE / "标普大盘红利50_三角形周期.pdf"
+PNG = BASE / "标普大盘红利.png"
+PDF = BASE / "标普大盘红利.pdf"
 
 plt.rcParams.update({
     "font.sans-serif": ["Microsoft YaHei", "SimHei"],
