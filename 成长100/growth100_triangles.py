@@ -3,11 +3,12 @@
 三个沿基线上行的“底→顶→底”三角形，第三个尚未走完：
 2013-06-25(1097) → 2015-06-12(4299) → 2019-01-03(1879)
 2019-01-03(1879) → 2021-09-15(8559) → 2024-02-05(4153)
-2024-02-05(4153) → 2026-06-22(17204) → 2028-10-20(约7952，推演：再跌 2 年、−20%)
+2024-02-05(4153) → 2026-06-22(17204) → 2028-04-20(约7527，推演：再跌 2.4 年、−20%)
 
 依赖：matplotlib（自带 numpy）。数据：同目录 cni_980080_daily.csv，缺失时自动从国证指数网抓取。
 运行：python growth100_triangles.py
 输出：同目录 成长100_三角形周期与推演.png / .pdf
+图上另标注：当前点位相对基线的偏离、以及该偏离在历史中的百分位（越低越便宜）。
 """
 import csv
 import json
@@ -248,6 +249,14 @@ def main():
     line_today = line_at(last_date)
     gap = (last_close / line_today - 1) * 100
 
+    # 偏离的历史分位：逐日算「价格/基线−1」，看当前偏离排在历史的第几百分位（越低越便宜）
+    # 起点取第一个拟合低点（2013-06），不把基线在数据之前的推演段算进分布
+    pct_start = datetime.strptime(TURNS[0][0], "%Y-%m-%d")
+    dev_hist = [(v / line_at(d) - 1) * 100 for d, v in data if d >= pct_start]
+    pct_rank = 100.0 * sum(1 for x in dev_hist if x <= gap) / len(dev_hist)
+    dev_min, dev_max = min(dev_hist), max(dev_hist)
+    dev_med = sorted(dev_hist)[len(dev_hist) // 2]
+
     proj_date = last_date + timedelta(days=PROJ_DAYS)
     proj_price = line_at(proj_date)
 
@@ -343,12 +352,20 @@ def main():
     label_x = last_date + timedelta(days=12)
     label_y = max(last_close * 1.55, 15000)
     ax.annotate(f"当前 {last_close:,.0f}（{last_date.date()}）{cur_tag}\n"
-                f"较基线 {gap:+.0f}%｜本轮 {(last_close / turns[-1][1] - 1) * 100:.1f}%",
+                f"较基线 {gap:+.0f}%｜历史 {pct_rank:.0f}% 分位｜本轮 {(last_close / turns[-1][1] - 1) * 100:.1f}%",
                 xy=(last_date, last_close), xytext=(label_x, label_y),
                 textcoords="data", fontsize=8.3, color="#3a3a3a", ha="left", va="center", zorder=9,
                 linespacing=1.5,
                 bbox=dict(boxstyle="round,pad=0.4", fc="white", ec="#c9d3df", lw=0.8),
                 arrowprops=dict(arrowstyle="-", color="#c9c9c9", lw=0.8, shrinkA=2, shrinkB=4))
+
+    # 偏离分位的说明（右下角空白处）
+    ax.text(0.575, 0.035,
+            f"偏离分位（{pct_start.strftime('%Y-%m')} 起）：逐日算「价格/基线−1」，"
+            f"当前 {gap:+.1f}% 排在 {pct_rank:.0f}% 分位\n"
+            f"（历史区间 {dev_min:+.0f}% ~ {dev_max:+.0f}%，中位 {dev_med:+.0f}%；越低越便宜）",
+            transform=ax.transAxes, fontsize=7.6, color="#7a7a7a", ha="left", va="bottom",
+            zorder=9, linespacing=1.4)
 
     ax.set_yscale("log")
     ax.set_ylim(820, 24000)
@@ -386,7 +403,7 @@ def main():
     fig.savefig(PNG, facecolor="white")
     fig.savefig(PDF, facecolor="white")
     print(f"saved {PNG.name} / {PDF.name}")
-    print(f"基线年化 {ann:.2f}%｜当前 {last_close:.2f}，较基线 {gap:+.1f}%")
+    print(f"基线年化 {ann:.2f}%｜当前 {last_close:.2f}，较基线 {gap:+.1f}%（历史 {pct_rank:.0f}% 分位）")
     print(f"推演底 {proj_date.date()} 约 {proj_price:.0f}，基线届时 {proj_price:.0f}")
 
 
