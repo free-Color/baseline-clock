@@ -11,6 +11,8 @@
 图上另标注：当前价相对基线的偏离及其历史分位、以及「价格不动、基线多久追上现价」的被套时间。
 
 依赖：matplotlib。数据：同目录 cni_980081_daily.csv。
+盘中：国证日线当天不出，用跟踪同一指数的 ETF（腾讯行情）当日涨跌幅折算当天点位顺延；
+      日线口径仍只存国证官网收盘价，CSV 不写入折算值。
 运行：python value100_triangles.py
 输出：同目录 价值100_三角形周期.png / .pdf
 """
@@ -68,6 +70,17 @@ CYCLE_POS = [(dt(2014, 8, 1), 2150), (dt(2017, 6, 1), 2600),
 
 API = "http://hq.cnindex.com.cn/market/market/getIndexDailyDataWithDataFormat"
 
+# 实时点位：腾讯行情（qt.gtimg.cn，GBK 文本）。
+# 980081 是国证自有编码，腾讯只覆盖交易所挂牌的指数（399xxx），没有 980081；
+# 因此用跟踪同一指数的 ETF 当日涨跌幅折算成指数点位：
+#     今日点位 ≈ 最后一个收盘 × (1 + ETF 涨跌幅)
+# 候选按跟踪偏差排序（近 3 个月日涨跌幅 vs 指数 MAE：159263 约 0.13%、159096 约 0.12%），
+# 取第一只取数成功的；日线口径仍是国证官网收盘。
+QUOTE_SYMBOLS = ["sz159263", "sz159096", "sz159037", "sz158001"]
+QUOTE_URL = "https://qt.gtimg.cn/q={}"
+QUOTE_HEADERS = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn"}
+
+
 
 def fetch_range(start, end):
     """抓 [start, end] 的日线，返回 [(datetime, close)]；网络异常直接抛出。"""
@@ -87,6 +100,61 @@ def fetch_full():
     rows = fetch_range("2000-01-01", today)
     rows += fetch_range((date.today() - timedelta(days=60)).isoformat(), today)
     return sorted(dict(rows).items())
+
+
+def fetch_quote():
+    """腾讯实时行情（ETF 代理），返回 (code, date, price, prev_close, hhmm)；失败抛异常。
+
+    字段（~ 分隔）：3=现价、4=昨收、30=时间戳 yyyyMMddHHmmss。
+    """
+    last_err = None
+    for code in QUOTE_SYMBOLS:
+        try:
+            req = urllib.request.Request(QUOTE_URL.format(code), headers=QUOTE_HEADERS)
+            with urllib.request.urlopen(req, timeout=15) as r:
+                txt = r.read().decode("gbk", "ignore")
+            if '"' not in txt:
+                raise ValueError("腾讯接口无数据")
+            f = txt.split('"')[1].split("~")
+            if len(f) < 33 or not f[3] or not f[4]:
+                raise ValueError("腾讯接口无数据")
+            price, prev = float(f[3]), float(f[4])
+            if price <= 0 or prev <= 0:
+                raise ValueError("腾讯行情价格异常")
+            d = dt.strptime(f[30][:8], "%Y%m%d").date()
+            return code, d, price, prev, f[30][8:12]
+        except Exception as e:  # noqa: BLE001
+            last_err = f"{code}: {type(e).__name__}: {e}"
+    raise ValueError(last_err or "腾讯接口无数据")
+
+
+def fill_live(rows):
+    """日线还没更新到当天时，用腾讯行情（ETF 涨跌幅）把序列顺延到当天。
+
+    只追加“当天”这一根；中间缺的交易日由 load() 的日线增量补齐。
+    返回 (rows, live_info or None)。
+    """
+    last_d, last_close = rows[-1][0].date(), rows[-1][1]
+    try:
+        code, qd, etf, prev, qt = fetch_quote()
+    except Exception as e:  # noqa: BLE001
+        print(f"[警告] 实时点位获取失败（{type(e).__name__}: {e}），只用日线")
+        return rows, None
+    if qd <= last_d:
+        return rows, None
+    if (qd - last_d).days > 5:
+        print(f"[警告] 日线停在 {last_d}，实时已是 {qd}（隔 {(qd - last_d).days} 天），跳过顺延，先补日线")
+        return rows, None
+
+    chg = etf / prev - 1
+    qp = last_close * (1 + chg)          # ETF 涨跌幅折算成指数点位
+    out = list(rows) + [(dt(qd.year, qd.month, qd.day), qp)]
+    live = {"date": qd, "price": qp, "time": qt, "nav_date": last_d,
+            "days": 1, "intraday": qt < "1500", "proxy": code[-6:]}
+    tag = "盘中" if live["intraday"] else "收盘价（日线未出）"
+    print(f"日线截至 {last_d}，用腾讯 {code[-6:]} {etf:.3f}（{chg:+.2%}）折算，"
+          f"顺延 1 天：{qd} {tag} {qp:,.2f}")
+    return out, live
 
 
 def read_csv():
@@ -154,7 +222,7 @@ def load():
             print(f"数据已是最新（{last_date_local.date()}，共 {len(rows)} 行）")
         return rows
     except Exception as e:  # noqa: BLE001
-        print(f"⚠ 联网检查失败（{type(e).__name__}: {e}），改用本地数据，截至 {last_date_local.date()}")
+        print(f"[警告] 联网检查失败（{type(e).__name__}: {e}），改用本地数据，截至 {last_date_local.date()}")
         return local
 
 
@@ -172,10 +240,11 @@ def fit_line(xs, ys):
 
 
 def main():
-    data = load()
+    data, live = fill_live(load())
     close = dict(data)
     t0 = data[0][0]
     last_date, last_close = data[-1]
+    cur_tag = "｜盘中" if (live and live["intraday"]) else ""
 
     # 校验关键日期是否都在数据里（数据被截断时给出明确提示，而不是 KeyError）
     need = [dt.strptime(d, "%Y-%m-%d") for d, _ in TURNS] + \
@@ -294,7 +363,7 @@ def main():
     # 当前点位
     ax.scatter([last_date], [last_close], s=42, facecolor="white", edgecolor="#6f6f6f",
                zorder=8, linewidth=1.4)
-    ax.annotate(f"当前 {last_close:,.0f}（{last_date.date()}）\n"
+    ax.annotate(f"当前 {last_close:,.0f}（{last_date.date()}）{cur_tag}\n"
                 f"较基线 {gap:+.1f}%｜历史 {pct_rank:.0f}% 分位\n"
                 f"跌到基线还需 {drop_to_line:.1f}%\n"
                 f"价格不动约 {catch_months:.0f} 个月追平（{catch_date.strftime('%Y-%m')}）",
@@ -343,20 +412,24 @@ def main():
     ax.set_ylabel("指数点位（对数坐标）", fontsize=10.5, color=C_TXT, labelpad=10)
     ax.set_title("国证价值100指数（980081）：四个沿基线上行的三角形，第四个尚未确认",
                  fontsize=16, color="#1f4e79", fontweight="bold", loc="left", pad=40)
+    live_note = "｜当日为盘中实时点位，收盘后以日线为准" if (live and live["intraday"]) else ""
     ax.text(0.0, 1.02,
             f"{data[0][0].date()} ~ {last_date.date()}｜底→顶→底 用虚线连接；"
-            f"第四轮下跌进行中、低点未确认｜基线年化 +{ann:.1f}%",
+            f"第四轮下跌进行中、低点未确认｜基线年化 +{ann:.1f}%{live_note}",
             transform=ax.transAxes, fontsize=9.0, color="#5a5a5a")
     ax.legend(loc="upper left", fontsize=8.9, frameon=True, framealpha=0.95,
               edgecolor="#cfcfcf", borderpad=0.7)
 
-    fig.text(0.065, 0.024, "数据来源：国证指数网（cnindex.com.cn）官方日行情　·　绘图：Python / Matplotlib",
+    fig.text(0.065, 0.024, "数据来源：国证指数网（cnindex.com.cn）官方日行情　·　"
+                           "盘中顺延按腾讯行情 ETF 涨跌幅折算　·　绘图：Python / Matplotlib",
              fontsize=8.4, color="#7a7a7a")
 
     fig.savefig(PNG, facecolor="white")
     fig.savefig(PDF, facecolor="white")
     print(f"saved {PNG.name} / {PDF.name}")
-    print(f"基线年化 {ann:.2f}%｜当前 {last_close:.2f}，较基线 {gap:+.1f}%（历史 {pct_rank:.0f}% 分位），"
+    spot = "盘中" if (live and live["intraday"]) else ("ETF 折算收盘" if live else "日线收盘")
+    print(f"基线年化 {ann:.2f}%｜当前 {last_close:.2f}（{last_date.date()} {spot}），"
+          f"较基线 {gap:+.1f}%（历史 {pct_rank:.0f}% 分位），"
           f"跌到基线 {drop_to_line:.1f}%，价格不动 {catch_months:.0f} 个月追平（{catch_date.strftime('%Y-%m')}）")
 
 
