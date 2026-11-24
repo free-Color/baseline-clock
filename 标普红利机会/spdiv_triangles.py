@@ -478,10 +478,8 @@ def main():
     fig.savefig(PNG, facecolor="white")
     fig.savefig(PDF, facecolor="white")
     print(f"saved {PNG.name} / {PDF.name}")
-    live_note = f"｜末点 {live['date']} 按 {live['proxy']} 成交价顺延" if live else "｜末点是官方净值"
-    where = (f"跌到基线 {abs(need):.1f}%" if last_close > line_today
-             else f"基线下方 {abs(need):.1f}%")
-    print(f"年化 {ann:.2f}%｜当前 {last_close:.0f}，较基线 {gap:+.1f}%，{where}{live_note}")
+    print(f"年化 {ann:.2f}%｜当前 {last_close:.0f}，较基线 {gap:+.1f}%（历史 {pct_rank:.0f}% 分位）"
+          f"，价格不动 {catch_months:.0f} 个月追平（{catch_date.strftime('%Y-%m')}）")
 
 
 if __name__ == "__main__":
