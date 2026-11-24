@@ -139,17 +139,58 @@ def write_csv(rows):
             w.writerow([d.strftime("%Y-%m-%d"), nav, cum, tr])
 
 
-def fetch_recent_closes(symbol_tx, count=250):
-    """腾讯前复权日线（当日那根随盘中滚动），返回 [(date, close)] 升序。"""
-    url = (f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
-           f"?param={symbol_tx},day,,,{count},qfq")
-    req = urllib.request.Request(url, headers=HEADERS)
+QQ_URL = ("https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get"
+          "?param={symbol},day,,,{count},qfq")
+
+
+def _qq_bars(symbol_tx, count):
+    """腾讯前复权日线（当日那根盘中实时滚动）。
+
+    走 proxy.finance.qq.com 的 App 接口；web.ifzq.gtimg.cn 那个老地址已被 WAF 挡成 501。
+    """
+    url = QQ_URL.format(symbol=symbol_tx, count=count)
+    req = urllib.request.Request(url, headers={**HEADERS, "Referer": "https://gu.qq.com/"})
     with urllib.request.urlopen(req, timeout=25) as r:
-        payload = json.loads(r.read().decode("utf-8"))
+        payload = json.loads(r.read().decode("utf-8", "ignore"))
     node = payload["data"][symbol_tx]
     bars = node.get("qfqday") or node.get("day") or []
-    out = [(dt.strptime(b[0][:10], "%Y-%m-%d").date(), float(b[2])) for b in bars]
-    return sorted((d, c) for d, c in out if c > 0)
+    if not bars:
+        raise RuntimeError("腾讯返回空")
+    return [(dt.strptime(b[0][:10], "%Y-%m-%d").date(), float(b[2])) for b in bars]
+
+
+def _sina_bars(symbol_tx, count):
+    """新浪日线（不复权，当日那根盘中实时滚动），仅兜底。"""
+    url = ("https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+           f"CN_MarketData.getKLineData?symbol={symbol_tx}"
+           f"&scale=240&ma=no&datalen={count}")
+    req = urllib.request.Request(url, headers=HEADERS)
+    with urllib.request.urlopen(req, timeout=25) as r:
+        rows = json.loads(r.read().decode("utf-8"))
+    if not rows:
+        raise RuntimeError("新浪返回空")
+    return [(dt.strptime(row["day"][:10], "%Y-%m-%d").date(), float(row["close"]))
+            for row in rows]
+
+
+def fetch_recent_closes(symbol_tx, count=250):
+    """日线收盘价，返回 [(date, close)] 升序。
+
+    主用腾讯前复权（含分红调整，口径与净值一致）；腾讯不通时退新浪不复权，
+    除息日会多出一笔假跌，只在主源不可用时才用。
+    """
+    for name, fn in (("腾讯", _qq_bars), ("新浪", _sina_bars)):
+        try:
+            bars = fn(symbol_tx, count)
+        except Exception as e:  # noqa: BLE001
+            print(f"[提示] {symbol_tx} {name}日线获取失败（{type(e).__name__}: {e}）")
+            continue
+        bars = [(d, c) for d, c in bars if c > 0]
+        if bars:
+            if name == "新浪":
+                print(f"[提示] {symbol_tx} 已退用新浪不复权日线，除息日口径略偏")
+            return sorted(bars)
+    raise RuntimeError("腾讯、新浪日线都拿不到")
 
 
 def fetch_quote(symbol_tx):
@@ -176,16 +217,16 @@ def fill_live(rows):
         try:
             bars = fetch_recent_closes(symbol_tx)
         except Exception as e:  # noqa: BLE001
-            print(f"⚠ {label} 成交价获取失败（{type(e).__name__}: {e}）")
+            print(f"[警告] {label} 成交价获取失败（{type(e).__name__}: {e}）")
             continue
         if bars and bars[0][0] <= last_d:
             used = (symbol_tx, label)
             break
         first = bars[0][0] if bars else "无数据"
-        print(f"⚠ {label} 成交价未覆盖 {last_d}（最早 {first}），换下一个代理")
+        print(f"[警告] {label} 成交价未覆盖 {last_d}（最早 {first}），换下一个代理")
 
     if used is None:
-        print("⚠ 没有可用的成交价代理，只用净值")
+        print("[警告] 没有可用的成交价代理，只用净值")
         return rows, None
     if bars[-1][0] <= last_d:
         return rows, None
@@ -195,7 +236,7 @@ def fill_live(rows):
         if d <= last_d:
             base, start = c, i
     if base is None:
-        print("⚠ 成交价序列未覆盖最后一个净值日，跳过顺延")
+        print("[警告]成交价序列未覆盖最后一个净值日，跳过顺延")
         return rows, None
 
     out = list(rows)
@@ -273,7 +314,7 @@ def load():
                   f"共 {len(rows)} 行（截至 {rows[-1][0].date()}）")
         return fill_live(rows)
     except Exception as e:  # noqa: BLE001
-        print(f"⚠ 联网检查失败（{type(e).__name__}: {e}），改用本地数据，截至 {last_d.date()}")
+        print(f"[警告]联网检查失败（{type(e).__name__}: {e}），改用本地数据，截至 {last_d.date()}")
         rows = build_tr(local)
     return fill_live(rows)
 
