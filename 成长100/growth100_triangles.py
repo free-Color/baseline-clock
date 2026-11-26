@@ -257,6 +257,11 @@ def main():
     dev_min, dev_max = min(dev_hist), max(dev_hist)
     dev_med = sorted(dev_hist)[len(dev_hist) // 2]
 
+    # 被套时间：价格原地不动，基线要涨多久才追上现价
+    t_years = math.log(last_close / line_today) / b if last_close > line_today else 0.0
+    catch_date = last_date + timedelta(days=int(round(t_years * 365.25)))
+    catch_months = t_years * 12
+
     proj_date = last_date + timedelta(days=PROJ_DAYS)
     proj_price = line_at(proj_date)
 
@@ -403,7 +408,8 @@ def main():
     fig.savefig(PNG, facecolor="white")
     fig.savefig(PDF, facecolor="white")
     print(f"saved {PNG.name} / {PDF.name}")
-    print(f"基线年化 {ann:.2f}%｜当前 {last_close:.2f}，较基线 {gap:+.1f}%（历史 {pct_rank:.0f}% 分位）")
+    print(f"基线年化 {ann:.2f}%｜当前 {last_close:.0f}，较基线 {gap:+.1f}%（历史 {pct_rank:.0f}% 分位）"
+          f"，价格不动 {catch_months:.0f} 个月追平（{catch_date.strftime('%Y-%m')}）")
     print(f"推演底 {proj_date.date()} 约 {proj_price:.0f}，基线届时 {proj_price:.0f}")
 
 
